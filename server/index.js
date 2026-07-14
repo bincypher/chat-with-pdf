@@ -2,7 +2,8 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
-const pdfParse = require('pdf-parse');
+const _pdfParseModule = require('pdf-parse');
+const pdfParse = _pdfParseModule && _pdfParseModule.default ? _pdfParseModule.default : _pdfParseModule;
 const fs = require("fs");
 const { GoogleGenAI } = require("@google/genai");
 const { QdrantClient } = require("@qdrant/js-client-rest");
@@ -54,6 +55,48 @@ function cosineSimilarity(vecA, vecB) {
     return dotProduct;
 }
 
+//handling the chunk overlapping
+function splitTextIntoChunks(text, maxLen = 1000, overlap = 200) {
+  const paragraphs = text
+    .split(/\n+/)
+    .map(p => p.trim())
+    .filter(Boolean);
+
+  const chunks = [];
+  let current = "";
+
+  for (const p of paragraphs) {
+    const candidate = current ? current + "\n\n" + p : p;
+    if (candidate.length <= maxLen) {
+      current = candidate;
+    } else {
+      if (current) chunks.push(current);
+      // If single paragraph longer than maxLen, push it alone (still useful)
+      if (p.length > maxLen) {
+        chunks.push(p);
+        current = "";
+      } else {
+        current = p;
+      }
+    }
+  }
+  if (current) chunks.push(current);
+
+  // add overlap by prefixing each chunk with tail of previous chunk
+  const overlapped = [];
+  for (let i = 0; i < chunks.length; i++) {
+    let chunk = chunks[i];
+    if (i > 0) {
+      const prev = overlapped[overlapped.length - 1];
+      const tail = prev.slice(-overlap);
+      chunk = tail + "\n\n" + chunk;
+    }
+    overlapped.push(chunk);
+  }
+
+  return overlapped.map(c => c.trim()).filter(Boolean);
+}
+
 
 //create a route for the home page
 app.get("/", async (req, res) => {
@@ -76,12 +119,13 @@ app.get("/create-collection", async (req, res) => {
 app.post("/upload", upload.single("pdf"), async (req, res) => {
     try {
         const dataBuffer = fs.readFileSync(req.file.path); //reads the uploaded file from the uploads folder
-        console.log('dataBuffer',dataBuffer);
+        // console.log('dataBuffer',dataBuffer);
         const pdfData = await pdfParse(dataBuffer);
-        console.log(pdfData.text);
-        const chunks = pdfData.text
-            .split("\n\n")
-            .filter((chunk) => chunk.trim() !== ""); //splits the text into chunks based on double newlines and filtering empty strings
+        // console.log(pdfData.text);
+        
+        const chunks = splitTextIntoChunks(pdfData.text, 1000, 200);
+        console.log('chunks:', chunks.length);
+        console.log('first chunk preview:', chunks[0]?.slice(0, 200));
         
         const embedding = await createEmbedding(chunks[0]);
         console.log(embedding.length);  // Should print: 3072, As of June 2024, Gemini embeddings are 3072 dimensions
