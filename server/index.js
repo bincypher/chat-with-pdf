@@ -30,7 +30,7 @@ const app = express(); //creates you express application
 const upload = multer({ dest: "uploads/" }); //creates a multer instance to handle file uploads
 app.use(cors()); //Allows browser requests from any origin
 app.use(express.json()); // Parses inoming json request bodies
-
+app.use(express.static("public")); // Serves static files from the public folder
 /*
 Two Different Models — Never Mix Them
 Model                       Use For                  Method
@@ -55,46 +55,61 @@ function cosineSimilarity(vecA, vecB) {
     return dotProduct;
 }
 
-//handling the chunk overlapping
-function splitTextIntoChunks(text, maxLen = 1000, overlap = 200) {
-  const paragraphs = text
-    .split(/\n+/)
-    .map(p => p.trim())
-    .filter(Boolean);
+// helper: chunk a single text into overlapped chunks (returns array of strings)
+function chunkTextWithOverlap(text, maxLen = 1000, overlap = 200) {
+    const paragraphs = text.split(/\n+/).map(p => p.trim()).filter(Boolean);
 
-  const chunks = [];
-  let current = "";
-
-  for (const p of paragraphs) {
-    const candidate = current ? current + "\n\n" + p : p;
-    if (candidate.length <= maxLen) {
-      current = candidate;
-    } else {
-      if (current) chunks.push(current);
-      // If single paragraph longer than maxLen, push it alone (still useful)
-      if (p.length > maxLen) {
-        chunks.push(p);
-        current = "";
-      } else {
-        current = p;
-      }
+    const chunks = [];
+    let current = "";
+    for (const p of paragraphs) {
+        const candidate = current ? current + "\n\n" + p : p;
+        if (candidate.length <= maxLen) {
+            current = candidate;
+        } else {
+            if (current) chunks.push(current);
+            if (p.length > maxLen) {
+                chunks.push(p);
+                current = "";
+            } else {
+                current = p;
+            }
+        }
     }
-  }
-  if (current) chunks.push(current);
+    if (current) chunks.push(current);
 
-  // add overlap by prefixing each chunk with tail of previous chunk
-  const overlapped = [];
-  for (let i = 0; i < chunks.length; i++) {
-    let chunk = chunks[i];
-    if (i > 0) {
-      const prev = overlapped[overlapped.length - 1];
-      const tail = prev.slice(-overlap);
-      chunk = tail + "\n\n" + chunk;
+    const overlapped = [];
+    for (let i = 0; i < chunks.length; i++) {
+        let chunk = chunks[i];
+        if (i > 0) {
+            const prev = overlapped[overlapped.length - 1];
+            const tail = prev.slice(-overlap);
+            chunk = tail + "\n\n" + chunk;
+        }
+        overlapped.push(chunk);
     }
-    overlapped.push(chunk);
-  }
+    return overlapped.map(c => c.trim()).filter(Boolean);
+}
 
-  return overlapped.map(c => c.trim()).filter(Boolean);
+// new metadata-aware chunker: returns [{ text, docName, page, chunkIndex }]
+function splitTextIntoChunksWithMeta(pdfData, fileName, maxLen = 1000, overlap = 200) {
+    const raw = pdfData && pdfData.text ? pdfData.text : "";
+    // pdf-parse often separates pages with form-feed '\f'; fallback to whole text if not present
+    const pages = raw.includes("\f") ? raw.split(/\f/) : [raw];
+    const result = [];
+    for (let p = 0; p < pages.length; p++) {
+        const pageText = pages[p].trim();
+        if (!pageText) continue;
+        const pageChunks = chunkTextWithOverlap(pageText, maxLen, overlap);
+        for (let ci = 0; ci < pageChunks.length; ci++) {
+            result.push({
+                text: pageChunks[ci],
+                docName: fileName,
+                page: p + 1,
+                chunkIndex: ci,
+            });
+        }
+    }
+    return result;
 }
 
 
@@ -104,13 +119,13 @@ app.get("/", async (req, res) => {
 });
 
 //create a route for creating a collection in Qdrant
-app.get("/create-collection", async (req, res) => {  
+app.get("/create-collection", async (req, res) => {
     try {
-        await qdrant.createCollection("pdf-docs", {    
-            vectors: { size: 3072, distance: "Cosine" },  
+        await qdrant.createCollection("pdf-docs", {
+            vectors: { size: 3072, distance: "Cosine" },
         });
         res.send("Collection created");
-    }catch (error) {
+    } catch (error) {
         res.status(500).send("Error creating collection: " + error.message);
     };
 });
@@ -122,66 +137,69 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
         // console.log('dataBuffer',dataBuffer);
         const pdfData = await pdfParse(dataBuffer);
         // console.log(pdfData.text);
-        
-        const chunks = splitTextIntoChunks(pdfData.text, 1000, 200);
+
+        const chunks = splitTextIntoChunksWithMeta(pdfData, req.file.originalname, 1000, 200);
         console.log('chunks:', chunks.length);
-        console.log('first chunk preview:', chunks[0]?.slice(0, 200));
-        
-        const embedding = await createEmbedding(chunks[0]);
+
+
+        const embedding = await createEmbedding(chunks[0].text);
         console.log(embedding.length);  // Should print: 3072, As of June 2024, Gemini embeddings are 3072 dimensions
 
+        // create embeddings for each chunk
         const chunkEmbeddings = [];
         for (const chunk of chunks) {
-            const embedding = await createEmbedding(chunk);
-            chunkEmbeddings.push({
-                text: chunk,
-                embedding: embedding,
-            });
+            const emb = await createEmbedding(chunk.text);
+            chunkEmbeddings.push({ ...chunk, embedding: emb });
         }
-        /**
-         Step by Step 
-         Step       Action
-         1          Get question from request body
-         2          Convert question to a vector
-         3          Loop through every chunk vector
-         4          Calculate similarity score
-         5          If score is better, update best
-         6          After loop: bestChunk is the answer
-         */
-        
-         //upsert the chunk embeddings into Qdrant
-        const points = chunkEmbeddings.map((item, index) => ({  
-            id: index + 1,  
-            vector: item.embedding,  
-            payload: {    
-                text: item.text,  
+
+
+        // create stable numeric ids for this upload (use timestamp + index)
+        const baseId = Date.now();
+        const points = chunkEmbeddings.map((item, i) => ({
+            id: baseId + i,
+            vector: item.embedding,
+            payload: {
+                text: item.text,
+                docName: item.docName,
+                page: item.page,
+                chunkIndex: item.chunkIndex,
             },
         }));
         await qdrant.upsert("pdf-docs", { points });
 
 
+        // handle the question
         const question = req.body.question;
         const questionEmbedding = await createEmbedding(question);
-        const searchResult = await qdrant.search("pdf-docs", {  
-            vector: questionEmbedding,  
-            limit: 1,
-            /**
-             What limit: 1 Means
-             limit: 1 returns only the single most similar chunk.
-             In production, 
-             use limit: 3 or limit: 5 to get multiple relevant chunks and send them all to Gemini — richer context, better answers.
-             */
+
+        // top-k search (try 3 or 5)
+        const TOP_K = 3;
+        const searchResult = await qdrant.search("pdf-docs", {
+            vector: questionEmbedding,
+            limit: TOP_K,
         });
-        const bestChunk = searchResult[0].payload.text;
+
+        // build citations and combined context
+        const citations = searchResult.map(r => ({
+            docName: r.payload.docName,
+            page: r.payload.page,
+            chunkIndex: r.payload.chunkIndex,
+            snippet: (r.payload.text || "").slice(0, 300),
+        }));
+        const combinedContext = searchResult.map(r => r.payload.text).join("\n\n---\n\n");
 
 
-        //sending best chunk to gemini for answer generation
+        // prompt the LLM with multiple chunks and ask for citations
         const response = await ai.models.generateContent({
-            model: "gemini-3.5-flash", 
-            contents: `Answer the question using only this context: ${bestChunk} 
-            Question: ${question}  `,
+            model: "gemini-3.5-flash",
+            contents: `Answer the question using ONLY the following context. When you reference facts, add citations in the format (doc: <docName>, page: <page>). Context:\n\n${combinedContext}\n\nQuestion: ${question}\n\nProvide a concise answer and list your citations at the end.`,
         });
-        res.send(response.text);
+
+        // return structured JSON
+        res.json({
+            answer: response.text,
+            citations,
+        });
 
         /*        
         Understanding the Code

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PDF QA Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 760px;
+      margin: 32px auto;
+      line-height: 1.6;
+    }
+    h1 { margin-bottom: 16px; }
+    label { display: block; margin-top: 16px; }
+    input[type="file"],
+    input[type="text"] {
+      width: 100%;
+      padding: 10px;
+      margin-top: 8px;
+      box-sizing: border-box;
+    }
+    button {
+      margin-top: 16px;
+      padding: 12px 18px;
+      font-size: 16px;
+    }
+    #status { margin-top: 20px; color: #333; }
+    pre { background: #f4f4f4; padding: 16px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>PDF QA Demo</h1>
+
+  <form id="qaForm">
+    <label>
+      Upload PDF
+      <input id="pdfFile" type="file" accept="application/pdf" required />
+    </label>
+
+    <label>
+      Question
+      <input id="question" type="text" placeholder="Ask a question about your PDF" required />
+    </label>
+
+    <button type="submit">Upload + Ask</button>
+  </form>
+
+  <div id="status"></div>
+  <pre id="output"></pre>
+
+  <script>
+    const form = document.getElementById("qaForm");
+    const status = document.getElementById("status");
+    const output = document.getElementById("output");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const fileInput = document.getElementById("pdfFile");
+      const pdfFile = fileInput.files[0];
+      const question = document.getElementById("question").value.trim();
+
+      if (!pdfFile || !question) {
+        status.textContent = "Please select a PDF and enter a question.";
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("pdf", pdfFile);
+      formData.append("question", question);
+
+      status.textContent = "Uploading PDF and querying...";
+      output.textContent = "";
+
+      try {
+        const response = await fetch("/upload", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error("Server error: " + response.status + " " + text);
+        }
+
+        const data = await response.json();
+        status.textContent = "Success";
+
+        output.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        status.textContent = "Error: " + err.message;
+      }
+    });
+  </script>
+</body>
+</html>
