@@ -2,75 +2,147 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>PDF QA Demo</title>
+  <title>PDF Chat Demo</title>
   <style>
     body {
       font-family: Arial, sans-serif;
-      max-width: 760px;
-      margin: 32px auto;
-      line-height: 1.6;
+      max-width: 900px;
+      margin: 24px auto;
+      padding: 16px;
+      line-height: 1.5;
+      background: #f7f8fb;
+      color: #222;
     }
-    h1 { margin-bottom: 16px; }
-    label { display: block; margin-top: 16px; }
-    input[type="file"],
-    input[type="text"] {
+    .card {
+      background: white;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      margin-bottom: 16px;
+    }
+    h1 { margin-top: 0; }
+    input[type="file"], input[type="text"], textarea {
       width: 100%;
       padding: 10px;
       margin-top: 8px;
       box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 8px;
     }
     button {
-      margin-top: 16px;
-      padding: 12px 18px;
-      font-size: 16px;
+      margin-top: 12px;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      background: #2563eb;
+      color: white;
+      font-size: 15px;
     }
-    #status { margin-top: 20px; color: #333; }
-    pre { background: #f4f4f4; padding: 16px; white-space: pre-wrap; }
+    button.secondary {
+      background: #6b7280;
+      margin-left: 8px;
+    }
+    #status {
+      margin-top: 10px;
+      color: #444;
+      font-size: 14px;
+    }
+    #chatBox {
+      display: none;
+      margin-top: 16px;
+    }
+    #messages {
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 12px;
+      min-height: 220px;
+      max-height: 320px;
+      overflow-y: auto;
+      background: #fafafa;
+      margin-bottom: 10px;
+    }
+    .msg {
+      margin-bottom: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+    }
+    .user {
+      background: #dbeafe;
+      margin-left: 30px;
+    }
+    .assistant {
+      background: #ecfdf3;
+      margin-right: 30px;
+    }
+    .citations {
+      font-size: 12px;
+      color: #555;
+      margin-top: 6px;
+    }
   </style>
 </head>
 <body>
-  <h1>PDF QA Demo</h1>
+  <div class="card">
+    <h1>PDF Chat Demo</h1>
 
-  <form id="qaForm">
     <label>
       Upload PDF
-      <input id="pdfFile" type="file" accept="application/pdf" required />
+      <input id="pdfFile" type="file" accept="application/pdf" />
     </label>
 
-    <label>
-      Question
-      <input id="question" type="text" placeholder="Ask a question about your PDF" required />
-    </label>
+    <button id="uploadBtn">Upload PDF</button>
+    <button id="clearBtn" class="secondary">Clear Chat</button>
 
-    <button type="submit">Upload + Ask</button>
-  </form>
+    <div id="status">Choose a PDF and upload it.</div>
+  </div>
 
-  <div id="status"></div>
-  <pre id="output"></pre>
+  <div class="card" id="chatBox">
+    <div id="messages"></div>
+
+    <input id="questionInput" type="text" placeholder="Ask a question about the PDF" />
+    <button id="sendBtn">Send</button>
+  </div>
 
   <script>
-    const form = document.getElementById("qaForm");
+    const uploadBtn = document.getElementById("uploadBtn");
+    const sendBtn = document.getElementById("sendBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const pdfFile = document.getElementById("pdfFile");
+    const questionInput = document.getElementById("questionInput");
     const status = document.getElementById("status");
-    const output = document.getElementById("output");
+    const messagesBox = document.getElementById("messages");
+    const chatBox = document.getElementById("chatBox");
 
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
+    let sessionId = "session-" + Date.now();
+    let uploaded = false;
 
-      const fileInput = document.getElementById("pdfFile");
-      const pdfFile = fileInput.files[0];
-      const question = document.getElementById("question").value.trim();
+    function addMessage(role, text, citations = []) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      div.innerHTML = `<div>${text}</div>`;
+      if (citations.length) {
+        const cites = document.createElement("div");
+        cites.className = "citations";
+        cites.textContent = "Sources: " + citations.map(c => `doc:${c.docName} page:${c.page}`).join(" | ");
+        div.appendChild(cites);
+      }
+      messagesBox.appendChild(div);
+      messagesBox.scrollTop = messagesBox.scrollHeight;
+    }
 
-      if (!pdfFile || !question) {
-        status.textContent = "Please select a PDF and enter a question.";
+    uploadBtn.addEventListener("click", async () => {
+      const file = pdfFile.files[0];
+      if (!file) {
+        status.textContent = "Please choose a PDF first.";
         return;
       }
 
       const formData = new FormData();
-      formData.append("pdf", pdfFile);
-      formData.append("question", question);
+      formData.append("pdf", file);
 
-      status.textContent = "Uploading PDF and querying...";
-      output.textContent = "";
+      status.textContent = "Uploading and indexing PDF...";
+      uploadBtn.disabled = true;
 
       try {
         const response = await fetch("/upload", {
@@ -78,18 +150,63 @@
           body: formData,
         });
 
+        const data = await response.json();
+
         if (!response.ok) {
-          const text = await response.text();
-          throw new Error("Server error: " + response.status + " " + text);
+          throw new Error(data.error || "Upload failed");
         }
 
-        const data = await response.json();
-        status.textContent = "Success";
-
-        output.textContent = JSON.stringify(data, null, 2);
+        status.textContent = `Uploaded: ${data.fileName || file.name}`;
+        uploaded = true;
+        chatBox.style.display = "block";
+        addMessage("assistant", `PDF ready. You can now ask questions about it.`);
       } catch (err) {
         status.textContent = "Error: " + err.message;
+      } finally {
+        uploadBtn.disabled = false;
       }
+    });
+
+    sendBtn.addEventListener("click", async () => {
+      const question = questionInput.value.trim();
+      if (!uploaded) {
+        status.textContent = "Upload a PDF first.";
+        return;
+      }
+      if (!question) {
+        status.textContent = "Type a question.";
+        return;
+      }
+
+      addMessage("user", question);
+      questionInput.value = "";
+
+      status.textContent = "Searching and answering...";
+      sendBtn.disabled = true;
+
+      try {
+        const response = await fetch("/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question, sessionId }),
+        });
+
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Query failed");
+
+        addMessage("assistant", data.answer || "No answer returned.", data.citations || []);
+        status.textContent = "Answer ready.";
+      } catch (err) {
+        status.textContent = "Error: " + err.message;
+      } finally {
+        sendBtn.disabled = false;
+      }
+    });
+
+    clearBtn.addEventListener("click", () => {
+      messagesBox.innerHTML = "";
+      sessionId = "session-" + Date.now();
+      status.textContent = "Chat cleared. Upload a PDF again if needed.";
     });
   </script>
 </body>

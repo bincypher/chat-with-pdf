@@ -133,27 +133,26 @@ app.get("/create-collection", async (req, res) => {
 //create a route for file uploads
 app.post("/upload", upload.single("pdf"), async (req, res) => {
     try {
-        const dataBuffer = fs.readFileSync(req.file.path); //reads the uploaded file from the uploads folder
-        // console.log('dataBuffer',dataBuffer);
+        if (!req.file) {
+            return res.status(400).json({ error: "PDF file is required" });
+        }
+
+        const dataBuffer = fs.readFileSync(req.file.path);
         const pdfData = await pdfParse(dataBuffer);
-        // console.log(pdfData.text);
 
-        const chunks = splitTextIntoChunksWithMeta(pdfData, req.file.originalname, 1000, 200);
-        console.log('chunks:', chunks.length);
+        const chunks = splitTextIntoChunksWithMeta(
+            pdfData,
+            req.file.originalname,
+            1000,
+            200
+        );
 
-
-        const embedding = await createEmbedding(chunks[0].text);
-        console.log(embedding.length);  // Should print: 3072, As of June 2024, Gemini embeddings are 3072 dimensions
-
-        // create embeddings for each chunk
         const chunkEmbeddings = [];
         for (const chunk of chunks) {
             const emb = await createEmbedding(chunk.text);
             chunkEmbeddings.push({ ...chunk, embedding: emb });
         }
 
-
-        // create stable numeric ids for this upload (use timestamp + index)
         const baseId = Date.now();
         const points = chunkEmbeddings.map((item, i) => ({
             id: baseId + i,
@@ -165,54 +164,88 @@ app.post("/upload", upload.single("pdf"), async (req, res) => {
                 chunkIndex: item.chunkIndex,
             },
         }));
+
         await qdrant.upsert("pdf-docs", { points });
 
+        const question = req.body.question?.trim();
 
-        // handle the question
-        const question = req.body.question;
+        if (!question) {
+            return res.json({
+                status: "uploaded",
+                message: "PDF indexed successfully",
+                fileName: req.file.originalname,
+                chunksIndexed: chunks.length,
+            });
+        }
+
         const questionEmbedding = await createEmbedding(question);
-
-        // top-k search (try 3 or 5)
-        const TOP_K = 3;
         const searchResult = await qdrant.search("pdf-docs", {
             vector: questionEmbedding,
-            limit: TOP_K,
+            limit: 3,
         });
 
-        // build citations and combined context
         const citations = searchResult.map(r => ({
             docName: r.payload.docName,
             page: r.payload.page,
             chunkIndex: r.payload.chunkIndex,
             snippet: (r.payload.text || "").slice(0, 300),
         }));
+
         const combinedContext = searchResult.map(r => r.payload.text).join("\n\n---\n\n");
 
-
-        // prompt the LLM with multiple chunks and ask for citations
         const response = await ai.models.generateContent({
             model: "gemini-3.5-flash",
-            contents: `Answer the question using ONLY the following context. When you reference facts, add citations in the format (doc: <docName>, page: <page>). Context:\n\n${combinedContext}\n\nQuestion: ${question}\n\nProvide a concise answer and list your citations at the end.`,
+            contents: `Answer the question using ONLY the following context. Context:\n\n${combinedContext}\n\nQuestion: ${question}`,
         });
 
-        // return structured JSON
         res.json({
             answer: response.text,
             citations,
         });
-
-        /*        
-        Understanding the Code
-        Part                             Meaning
-        ai.models.generateContent()   Calls Gemini to generate text
-        model: "gemini-3.5-flash"     Which Gemini model to use
-        contents:                     The full prompt including your PDF content
-        response.text                 The generated answer from Gemini
-        */
-
     } catch (error) {
         console.error(error);
-        res.status(500).send("Error reading PDF");
+        res.status(500).json({ error: "Error reading PDF" });
+    }
+});
+
+//create a route for querying the uploaded PDF
+app.post("/query", async (req, res) => {
+    try {
+        const { question, sessionId } = req.body;
+
+        if (!question) {
+            return res.status(400).json({ error: "Question is required" });
+        }
+
+        const questionEmbedding = await createEmbedding(question);
+
+        const searchResult = await qdrant.search("pdf-docs", {
+            vector: questionEmbedding,
+            limit: 3,
+        });
+
+        const citations = searchResult.map(r => ({
+            docName: r.payload.docName,
+            page: r.payload.page,
+            chunkIndex: r.payload.chunkIndex,
+            snippet: (r.payload.text || "").slice(0, 300),
+        }));
+
+        const combinedContext = searchResult.map(r => r.payload.text).join("\n\n---\n\n");
+
+        const response = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: `Answer the question using ONLY the following context. Context:\n\n${combinedContext}\n\nQuestion: ${question}`,
+        });
+
+        res.json({
+            answer: response.text,
+            citations,
+            sessionId: sessionId || "default"
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: "Query failed" });
     }
 });
 
